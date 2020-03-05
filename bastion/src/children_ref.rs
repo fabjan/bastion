@@ -272,3 +272,21 @@ impl PartialEq for ChildrenRef {
 }
 
 impl Eq for ChildrenRef {}
+
+#[test]
+fn test_failure_on_msg_send() {
+    use futures::channel::mpsc;
+    let (sender, _) = mpsc::unbounded();
+    sender.close_channel();
+    let child_ref = ChildrenRef::new(
+        BastionId::new(),
+        sender,
+        Arc::new(BastionPath::root()),
+        Vec::default(),
+        Vec::default(),
+    );
+
+    let msg = BastionMessage::broadcast("hello");
+    let env = Envelope::from_dead_letters(msg);
+    child_ref.send(env).unwrap();
+}
