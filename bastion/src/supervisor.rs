@@ -5,7 +5,7 @@ use crate::broadcast::{Broadcast, Parent, Sender};
 use crate::callbacks::Callbacks;
 use crate::children::Children;
 use crate::children_ref::ChildrenRef;
-use crate::context::BastionId;
+use crate::context::{BastionId, ContextState};
 use crate::envelope::Envelope;
 use crate::message::{BastionMessage, Deployment, Message};
 use crate::path::{BastionPath, BastionPathElement};
@@ -17,10 +17,12 @@ use futures_timer::Delay;
 use fxhash::FxHashMap;
 use lightproc::prelude::*;
 use log::Level;
+use qutex::Qutex;
 use std::cmp::{Eq, PartialEq};
 use std::collections::HashMap;
 use std::ops::Range;
 use std::sync::Arc;
+use std::pin::Pin;
 use std::task::Poll;
 use std::time::Duration;
 
@@ -68,8 +70,7 @@ pub struct Supervisor {
     // It is only updated when at least one of those is resat.
     order: Vec<BastionId>,
     // The currently launched supervised children and supervisors.
-    // The last value is the amount of times a given actor has restarted.
-    launched: FxHashMap<BastionId, (usize, RecoverableHandle<Supervised>, usize)>,
+    launched: FxHashMap<BastionId, SupervisedState>,
     // Supervised children and supervisors that are stopped.
     // This is used when resetting or recovering when the
     // supervision strategy is not "one-for-one".
@@ -91,6 +92,21 @@ pub struct Supervisor {
     // is received.
     pre_start_msgs: Vec<Envelope>,
     started: bool,
+}
+
+#[derive(Debug)]
+/// A special wrapper for the supervised actor data which is
+/// using for restoring from the failed or stopped states.
+struct SupervisedState {
+    // Position of the actor in the `Supervisor.order` vector.
+    order_index: usize,
+    // Handle for recovering a failed actor.
+    recover_handle: RecoverableHandle<Supervised>,
+    // Stores the amount of restarts for the tracked actor.
+    restarts_count: usize,
+    // The state of the tracked actor. Used for restoring
+    // the actor after being killed / stopped / panic.
+    state: Qutex<Pin<Box<ContextState>>>,
 }
 
 #[derive(Debug, Clone)]
@@ -191,6 +207,16 @@ pub enum ActorRestartStrategy {
         /// Defines a multiplier how fast the timeout will be increasing.
         multiplier: u64,
     },
+}
+
+// Special structure that hold an information about the actors
+// during restarts
+struct IntermediateActorState {
+    // Stores the amount of restarts for the tracked actor.
+    restarts_count: usize,
+    // The state of the tracked actor. Used for restoring
+    // the actor after being killed / stopped / panic.
+    state: Qutex<Pin<Box<ContextState>>>,
 }
 
 impl Supervisor {
@@ -773,15 +799,16 @@ impl Supervisor {
     }
 
     async fn restart(&mut self, range: Range<usize>) {
-        let mut tracked_actors = HashMap::new();
+        let mut preserved_actors = HashMap::new();
         for index in range.clone() {
-            let bastion_id = self.order[index].clone();
-            let restart_count = match self.launched.get(&bastion_id) {
-                Some((_, _, count)) => *count,
-                None => 0,
+            let old_bastion_id = self.order[index].clone();
+            let intermediate_state = match self.launched.get(&old_bastion_id) {
+                Some(supervised_state) => IntermediateActorState::default()
+                    .with_restarts_count(supervised_state.restarts_count)
+                    .with_state(supervised_state.state.clone()),
+                None => IntermediateActorState::default(),
             };
-
-            tracked_actors.insert(bastion_id, restart_count);
+            preserved_actors.insert(old_bastion_id, intermediate_state);
         }
 
         debug!("Supervisor({}): Restarting range: {:?}", self.id(), range);
@@ -811,8 +838,8 @@ impl Supervisor {
                 supervised.elem().clone().with_id(BastionId::new()),
             );
 
-            let actor_restarts_count = match tracked_actors.get(&id.clone()) {
-                Some(count) => *count + 1,
+            let actor_restarts_count = match preserved_actors.get(&id.clone()) {
+                Some(intermediate_state) => intermediate_state.restarts_count + 1,
                 None => 1,
             };
 
@@ -859,9 +886,15 @@ impl Supervisor {
             reset.len()
         );
         while let Some((old_bastion_id, supervised)) = reset.next().await {
+            let (restarts_count, state) = match preserved_actors.remove(&old_bastion_id) {
+                Some(intermediate_state) => (intermediate_state.restarts_count + 1, intermediate_state.state),
+                None => (1, Qutex::new(Box::pin(ContextState::new()))),
+            };
+
             self.bcast.register(supervised.bcast());
             if self.started {
                 let msg = BastionMessage::start();
+                // let msg = BastionMessage::restore(state.clone());
                 let env =
                     Envelope::new(msg, self.bcast.path().clone(), self.bcast.sender().clone());
                 self.bcast.send_child(supervised.id(), env);
@@ -873,13 +906,14 @@ impl Supervisor {
                 supervised.id()
             );
             let id = supervised.id().clone();
-            let restart_count = match tracked_actors.get(&old_bastion_id) {
-                Some(count) => *count + 1,
-                None => 1,
-            };
             let launched = supervised.launch();
-            self.launched
-                .insert(id.clone(), (self.order.len(), launched, restart_count));
+            let new_supervised_state = SupervisedState::new(
+                self.order.len(),
+                launched,
+                restarts_count,
+                state,
+            );
+            self.launched.insert(id.clone(), new_supervised_state);
             self.order.push(id);
         }
     }
@@ -900,9 +934,9 @@ impl Supervisor {
         // FIXME: panics?
         for id in self.order.get(range.clone()).unwrap() {
             // TODO: Err if None?
-            if let Some((_, launched, _)) = self.launched.remove(&id) {
+            if let Some(supervised_state) = self.launched.remove(&id) {
                 // TODO: add a "stopped" list and poll from it instead of awaiting
-                supervised.push(launched);
+                supervised.push(supervised_state.recover_handle);
             }
         }
 
@@ -941,9 +975,9 @@ impl Supervisor {
         // FIXME: panics?
         for id in self.order.get(range.clone()).unwrap() {
             // TODO: Err if None?
-            if let Some((_, launched, _)) = self.launched.remove(&id) {
+            if let Some(supervised_state) = self.launched.remove(&id) {
                 // TODO: add a "stopped" list and poll from it instead of awaiting
-                supervised.push(launched);
+                supervised.push(supervised_state.recover_handle);
             }
         }
 
@@ -982,8 +1016,8 @@ impl Supervisor {
         );
         match self.strategy {
             SupervisionStrategy::OneForOne => {
-                let (start, _, _) = self.launched.get(&id).ok_or(())?;
-                let start = *start;
+                let supervised_state = self.launched.get(&id).ok_or(())?;
+                let start = supervised_state.order_index;
 
                 self.restart(start..start + 1).await;
             }
@@ -995,8 +1029,8 @@ impl Supervisor {
                 self.killed.shrink_to_fit();
             }
             SupervisionStrategy::RestForOne => {
-                let (start, _, _) = self.launched.get(&id).ok_or(())?;
-                let start = *start;
+                let supervised_state = self.launched.get(&id).ok_or(())?;
+                let start = supervised_state.order_index;
 
                 self.restart(start..self.order.len()).await;
             }
@@ -1054,6 +1088,7 @@ impl Supervisor {
                     }
                 };
 
+                let state = Qutex::new(Box::pin(ContextState::new()));
                 self.bcast.register(supervised.bcast());
                 if self.started {
                     let msg = BastionMessage::start();
@@ -1067,12 +1102,21 @@ impl Supervisor {
                     self.id(),
                     supervised.id()
                 );
+
                 let id = supervised.id().clone();
-                let launched = supervised.launch();
-                self.launched
-                    .insert(id.clone(), (self.order.len(), launched, 0));
+                let supervised_state = SupervisedState::new(
+                    self.order.len(),
+                    supervised.launch(),
+                    0,
+                    state.clone(),
+                );
+                self.launched.insert(id.clone(), supervised_state);
                 self.order.push(id);
             }
+            Envelope {
+                msg: BastionMessage::Restore { .. },
+                ..
+            } => unimplemented!(),
             // FIXME
             Envelope {
                 msg: BastionMessage::Prune { .. },
@@ -1105,11 +1149,11 @@ impl Supervisor {
                 ..
             } => {
                 // FIXME: Err if None?
-                if let Some((_, launched, _)) = self.launched.remove(&id) {
+                if let Some(supervised_state) = self.launched.remove(&id) {
                     debug!("Supervisor({}): Supervised({}) stopped.", self.id(), id);
                     // TODO: add a "waiting" list an poll from it instead of awaiting
                     // FIXME: panics?
-                    let supervised = launched.await.unwrap();
+                    let supervised = supervised_state.recover_handle.await.unwrap();
                     supervised.callbacks().after_stop();
 
                     self.bcast.unregister(&id);
@@ -1584,6 +1628,22 @@ impl SupervisorRef {
     }
 }
 
+impl SupervisedState {
+    fn new(
+        order_index: usize,
+        recover_handle: RecoverableHandle<Supervised>,
+        restarts_count: usize,
+        state: Qutex<Pin<Box<ContextState>>>,
+    ) -> Self {
+        SupervisedState {
+            order_index,
+            recover_handle,
+            restarts_count,
+            state,
+        }
+    }
+}
+
 impl Supervised {
     fn supervisor(supervisor: Supervisor) -> Self {
         Supervised::Supervisor(supervisor)
@@ -1777,6 +1837,18 @@ impl RestartStrategy {
     }
 }
 
+impl IntermediateActorState {
+    fn with_restarts_count(mut self, restarts_count: usize) -> Self {
+        self.restarts_count = restarts_count;
+        self
+    }
+
+    fn with_state(mut self, state: Qutex<Pin<Box<ContextState>>>) -> Self {
+        self.state = state;
+        self
+    }
+}
+
 impl Default for SupervisionStrategy {
     fn default() -> Self {
         SupervisionStrategy::OneForOne
@@ -1795,6 +1867,15 @@ impl Default for RestartStrategy {
 impl Default for ActorRestartStrategy {
     fn default() -> Self {
         ActorRestartStrategy::Immediate
+    }
+}
+
+impl Default for IntermediateActorState {
+    fn default() -> Self {
+        IntermediateActorState {
+            restarts_count: 0,
+            state: Qutex::new(Box::pin(ContextState::new())),
+        }
     }
 }
 

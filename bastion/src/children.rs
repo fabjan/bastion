@@ -468,6 +468,11 @@ impl Children {
             } => unimplemented!(),
             // FIXME
             Envelope {
+                msg: BastionMessage::Restore { .. },
+                ..
+            } => unimplemented!(),
+            // FIXME
+            Envelope {
                 msg: BastionMessage::Prune { .. },
                 ..
             } => unimplemented!(),

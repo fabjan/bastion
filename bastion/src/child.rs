@@ -142,6 +142,13 @@ impl Child {
                 msg: BastionMessage::Deploy(_),
                 ..
             } => unimplemented!(),
+            Envelope {
+                msg: BastionMessage::Restore { state },
+                ..
+            } => {
+                debug!("Child({}): Restoring from a state: {:?}", self.id(), state);
+                self.state = state;
+            }
             // FIXME
             Envelope {
                 msg: BastionMessage::Prune { .. },

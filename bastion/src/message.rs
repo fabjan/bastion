@@ -7,10 +7,11 @@
 //! * Messages are not guaranteed to be ordered, all message's order is causal.
 //!
 use crate::children::Children;
-use crate::context::BastionId;
+use crate::context::{BastionId, ContextState};
 use crate::envelope::{RefAddr, SignedMessage};
 use crate::supervisor::{SupervisionStrategy, Supervisor};
 use futures::channel::oneshot::{self, Receiver};
+use qutex::Qutex;
 use std::any::{type_name, Any};
 use std::fmt::Debug;
 use std::future::Future;
@@ -189,6 +190,7 @@ pub(crate) enum BastionMessage {
     Stop,
     Kill,
     Deploy(Deployment),
+    Restore { state: Qutex<Pin<Box<ContextState>>> },
     Prune { id: BastionId },
     SuperviseWith(SupervisionStrategy),
     Message(Msg),
@@ -380,6 +382,10 @@ impl BastionMessage {
         BastionMessage::Deploy(deployment)
     }
 
+    pub(crate) fn restore(state: Qutex<Pin<Box<ContextState>>>) -> Self {
+        BastionMessage::Restore { state }
+    }
+
     pub(crate) fn prune(id: BastionId) -> Self {
         BastionMessage::Prune { id }
     }
@@ -419,6 +425,7 @@ impl BastionMessage {
             BastionMessage::Kill => BastionMessage::kill(),
             // FIXME
             BastionMessage::Deploy(_) => unimplemented!(),
+            BastionMessage::Restore { state }=> BastionMessage::restore(state.clone()),
             BastionMessage::Prune { id } => BastionMessage::prune(id.clone()),
             BastionMessage::SuperviseWith(strategy) => {
                 BastionMessage::supervise_with(strategy.clone())

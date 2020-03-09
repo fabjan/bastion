@@ -300,6 +300,11 @@ impl System {
                 // FIXME
                 Deployment::Children(_) => unimplemented!(),
             },
+            // FIXME
+            Envelope {
+                msg: BastionMessage::Restore { .. },
+                ..
+            } => unimplemented!(),
             Envelope {
                 msg: BastionMessage::Prune { id },
                 ..
