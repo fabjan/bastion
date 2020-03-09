@@ -53,8 +53,10 @@ fn failed_actors_group(children: Children) -> Children {
     // Specifying the child group, where each actor
     // will output the sentence in the stdout, then will fail
     // with panic.
-    children.with_exec(move |_ctx: BastionContext| async move {
-        println!("Worker started!");
-        panic!("Unexpected error...");
+    children.with_exec(move |_ctx: BastionContext| {
+        async move {
+            println!("Worker started!");
+            panic!("Unexpected error...");
+        }
     })
 }
